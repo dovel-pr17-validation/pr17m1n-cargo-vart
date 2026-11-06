@@ -1,0 +1,1535 @@
+use std::sync::Arc;
+
+use crate::{art::QueryType, KeyTrait};
+
+/*
+    Immutable nodes
+*/
+
+pub(crate) trait NodeTrait<N: Clone> {
+    fn clone(&self) -> Self;
+    fn add_child(&mut self, key: u8, node: N);
+    fn find_child(&self, key: u8) -> Option<&Arc<N>>;
+    fn find_child_mut(&mut self, key: u8) -> Option<&mut N>;
+    fn delete_child(&self, key: u8) -> Self;
+    fn num_children(&self) -> usize;
+    fn size(&self) -> usize;
+    fn replace_child(&self, key: u8, node: Arc<N>) -> Self;
+}
+
+#[derive(Clone, PartialEq, Debug)]
+pub(crate) enum LeafPayload<V: Clone> {
+    Empty,
+    Single(LeafValue<V>),
+    Versioned(Vec<LeafValue<V>>),
+}
+
+impl<V: Clone> LeafPayload<V> {
+    #[inline]
+    pub(crate) fn as_slice(&self) -> &[LeafValue<V>] {
+        match self {
+            Self::Empty => &[],
+            Self::Single(v) => std::slice::from_ref(v),
+            Self::Versioned(list) => list.as_slice(),
+        }
+    }
+
+    #[cfg(test)]
+    #[inline]
+    pub(crate) fn len(&self) -> usize {
+        self.as_slice().len()
+    }
+}
+
+impl<V: Clone> std::ops::Index<usize> for LeafPayload<V> {
+    type Output = LeafValue<V>;
+
+    #[inline]
+    fn index(&self, index: usize) -> &Self::Output {
+        &self.as_slice()[index]
+    }
+}
+
+#[derive(Clone)]
+pub(crate) struct TwigNode<K: KeyTrait, V: Clone> {
+    pub(crate) prefix: K,
+    pub(crate) key: K,
+    pub(crate) values: LeafPayload<V>,
+    pub(crate) version: u64, // Version for the twig node
+}
+
+// Timestamp-Version Ordering Constraint Explanation:
+// Given two internal keys associated with the same user key, represented as:
+// (key, version1, ts1) and (key, version2, ts2),
+// the following ordering constraints apply:
+//      - If version1 < version2, then it must be that ts1 <= ts2.
+//      - If ts1 < ts2, then it must be that version1 < version2.
+// This ensures a consistent ordering of versions based on their timestamps.
+//
+#[derive(Copy, Clone, PartialEq, PartialOrd, Eq, Ord, Debug)]
+pub(crate) struct LeafValue<V: Clone> {
+    pub(crate) value: V,
+    pub(crate) version: u64,
+    pub(crate) ts: u64,
+}
+
+impl<V: Clone> LeafValue<V> {
+    pub(crate) fn new(value: V, version: u64, ts: u64) -> Self {
+        LeafValue { value, version, ts }
+    }
+}
+
+impl<K: KeyTrait, V: Clone> TwigNode<K, V> {
+    #[inline]
+    pub(crate) fn new(prefix: K, key: K) -> Self {
+        TwigNode {
+            prefix,
+            key,
+            values: LeafPayload::Empty,
+            version: 0,
+        }
+    }
+
+    #[cfg(test)]
+    #[inline]
+    pub(crate) fn insert(&self, value: V, version: u64, ts: u64) -> TwigNode<K, V> {
+        let mut new_twig = self.clone();
+        new_twig.insert_mut(value, version, ts);
+        new_twig
+    }
+
+    #[inline]
+    pub(crate) fn insert_mut(&mut self, value: V, version: u64, ts: u64) {
+        let new_leaf = LeafValue::new(value, version, ts);
+        match &mut self.values {
+            LeafPayload::Empty => {
+                self.values = LeafPayload::Single(new_leaf);
+            }
+            LeafPayload::Single(single) => {
+                if single.version == version && single.ts == ts {
+                    *single = new_leaf;
+                } else {
+                    let old = single.clone();
+                    let list = if (old.version, old.ts) < (version, ts) {
+                        vec![old, new_leaf]
+                    } else {
+                        vec![new_leaf, old]
+                    };
+                    self.values = LeafPayload::Versioned(list);
+                }
+            }
+            LeafPayload::Versioned(list) => {
+                match list.binary_search_by(|v| (v.version, v.ts).cmp(&(version, ts))) {
+                    Ok(idx) => list[idx] = new_leaf,
+                    Err(idx) => list.insert(idx, new_leaf),
+                }
+            }
+        }
+        self.version = version.max(self.version);
+    }
+
+    #[inline]
+    pub(crate) fn replace_if_newer_mut(&mut self, value: V, version: u64, ts: u64) {
+        if version > self.version {
+            self.values = LeafPayload::Single(LeafValue::new(value, version, ts));
+            self.version = version;
+        }
+    }
+
+    #[inline]
+    pub(crate) fn iter(&self) -> std::slice::Iter<'_, LeafValue<V>> {
+        self.values.as_slice().iter()
+    }
+}
+
+/// Helper functions for TwigNode for timestamp-based queries
+impl<K: KeyTrait + Clone, V: Clone> TwigNode<K, V> {
+    #[inline]
+    pub(crate) fn get_leaf_by_query(&self, query_type: QueryType) -> Option<&LeafValue<V>> {
+        self.get_leaf_by_query_ref(query_type)
+    }
+
+    #[inline]
+    pub(crate) fn get_leaf_by_query_ref(&self, query_type: QueryType) -> Option<&LeafValue<V>> {
+        match query_type {
+            QueryType::LatestByVersion(version) => self.get_leaf_by_version(version),
+            QueryType::LatestByTs(ts) => self.get_leaf_by_ts(ts),
+            QueryType::LastLessThanTs(ts) => self.last_less_than_ts(ts),
+            QueryType::LastLessOrEqualTs(ts) => self.last_less_or_equal_ts(ts),
+            QueryType::FirstGreaterThanTs(ts) => self.first_greater_than_ts(ts),
+            QueryType::FirstGreaterOrEqualTs(ts) => self.first_greater_or_equal_ts(ts),
+        }
+    }
+
+    #[inline]
+    pub(crate) fn get_latest_leaf(&self) -> Option<&LeafValue<V>> {
+        match &self.values {
+            LeafPayload::Empty => None,
+            LeafPayload::Single(v) => Some(v),
+            LeafPayload::Versioned(list) => list.last(),
+        }
+    }
+
+    #[inline]
+    pub(crate) fn get_leaf_by_version(&self, version: u64) -> Option<&LeafValue<V>> {
+        match &self.values {
+            LeafPayload::Empty => None,
+            LeafPayload::Single(v) => {
+                if v.version <= version {
+                    Some(v)
+                } else {
+                    None
+                }
+            }
+            LeafPayload::Versioned(list) => {
+                let idx = list.partition_point(|v| v.version <= version);
+                if idx == 0 {
+                    None
+                } else {
+                    Some(&list[idx - 1])
+                }
+            }
+        }
+    }
+
+    #[inline]
+    pub(crate) fn get_leaf_by_ts(&self, ts: u64) -> Option<&LeafValue<V>> {
+        match &self.values {
+            LeafPayload::Empty => None,
+            LeafPayload::Single(v) => {
+                if v.ts <= ts {
+                    Some(v)
+                } else {
+                    None
+                }
+            }
+            LeafPayload::Versioned(list) => list.iter().filter(|v| v.ts <= ts).max_by_key(|v| v.ts),
+        }
+    }
+
+    #[inline]
+    pub(crate) fn get_all_versions(&self) -> Vec<(V, u64, u64)> {
+        self.values
+            .as_slice()
+            .iter()
+            .map(|v| (v.value.clone(), v.version, v.ts))
+            .collect()
+    }
+
+    #[inline]
+    pub(crate) fn last_less_than_ts(&self, ts: u64) -> Option<&LeafValue<V>> {
+        match &self.values {
+            LeafPayload::Empty => None,
+            LeafPayload::Single(v) => {
+                if v.ts < ts {
+                    Some(v)
+                } else {
+                    None
+                }
+            }
+            LeafPayload::Versioned(list) => list.iter().filter(|v| v.ts < ts).max_by_key(|v| v.ts),
+        }
+    }
+
+    #[inline]
+    pub(crate) fn last_less_or_equal_ts(&self, ts: u64) -> Option<&LeafValue<V>> {
+        self.get_leaf_by_ts(ts)
+    }
+
+    #[inline]
+    pub(crate) fn first_greater_than_ts(&self, ts: u64) -> Option<&LeafValue<V>> {
+        match &self.values {
+            LeafPayload::Empty => None,
+            LeafPayload::Single(v) => {
+                if v.ts > ts {
+                    Some(v)
+                } else {
+                    None
+                }
+            }
+            LeafPayload::Versioned(list) => list.iter().filter(|v| v.ts > ts).min_by_key(|v| v.ts),
+        }
+    }
+
+    pub(crate) fn validate_invariants(&self) -> Result<usize, String> {
+        let slice = self.values.as_slice();
+        if slice.is_empty() {
+            return Err("Twig node has empty values list".to_string());
+        }
+        for window in slice.windows(2) {
+            let a = (window[0].version, window[0].ts);
+            let b = (window[1].version, window[1].ts);
+            if a >= b {
+                return Err(format!(
+                    "Twig versions not strictly sorted: ({}, {}) >= ({}, {})",
+                    window[0].version, window[0].ts, window[1].version, window[1].ts
+                ));
+            }
+        }
+        Ok(1)
+    }
+
+    #[inline]
+    pub(crate) fn first_greater_or_equal_ts(&self, ts: u64) -> Option<&LeafValue<V>> {
+        match &self.values {
+            LeafPayload::Empty => None,
+            LeafPayload::Single(v) => {
+                if v.ts >= ts {
+                    Some(v)
+                } else {
+                    None
+                }
+            }
+            LeafPayload::Versioned(list) => list.iter().filter(|v| v.ts >= ts).min_by_key(|v| v.ts),
+        }
+    }
+}
+
+/// Inner node holding up to `WIDTH` sorted keys and parallel child pointers.
+/// Used for `Node4` and `Node16` layouts.
+pub(crate) struct FlatNode<P: KeyTrait, N, const WIDTH: usize> {
+    pub(crate) prefix: P,
+    keys: [u8; WIDTH],
+    children: [Option<Arc<N>>; WIDTH],
+    pub(crate) inner_twig: Option<Arc<N>>,
+    num_children: u8,
+}
+
+impl<P: KeyTrait, N: Clone, const WIDTH: usize> FlatNode<P, N, WIDTH> {
+    pub(crate) fn new(prefix: P) -> Self {
+        Self {
+            prefix,
+            keys: [0; WIDTH],
+            children: [const { None }; WIDTH],
+            inner_twig: None,
+            num_children: 0,
+        }
+    }
+
+    #[inline]
+    fn find_pos(&self, key: u8) -> Option<usize> {
+        let count = self.num_children as usize;
+        if count >= WIDTH {
+            None
+        } else {
+            Some(self.keys[..count].partition_point(|&c| c < key))
+        }
+    }
+
+    #[inline]
+    fn index(&self, key: u8) -> Option<usize> {
+        let count = (self.num_children as usize).min(WIDTH);
+        if WIDTH == 16 && cfg!(target_endian = "little") {
+            let k_broadcast = u64::from_ne_bytes([key; 8]);
+            let w0 = u64::from_ne_bytes(self.keys[0..8].try_into().unwrap());
+            let diff0 = w0 ^ k_broadcast;
+            let zeroes0 =
+                (diff0.wrapping_sub(0x0101_0101_0101_0101)) & (!diff0) & 0x8080_8080_8080_8080;
+            if zeroes0 != 0 {
+                let pos = (zeroes0.trailing_zeros() / 8) as usize;
+                if pos < count {
+                    return Some(pos);
+                }
+            }
+            if count > 8 {
+                let w1 = u64::from_ne_bytes(self.keys[8..16].try_into().unwrap());
+                let diff1 = w1 ^ k_broadcast;
+                let zeroes1 =
+                    (diff1.wrapping_sub(0x0101_0101_0101_0101)) & (!diff1) & 0x8080_8080_8080_8080;
+                if zeroes1 != 0 {
+                    let pos = 8 + (zeroes1.trailing_zeros() / 8) as usize;
+                    if pos < count {
+                        return Some(pos);
+                    }
+                }
+            }
+            None
+        } else {
+            self.keys[..count].binary_search(&key).ok()
+        }
+    }
+
+    pub(crate) fn resize<const NEW_WIDTH: usize>(&self) -> FlatNode<P, N, NEW_WIDTH> {
+        let mut new_node = FlatNode::<P, N, NEW_WIDTH>::new(self.prefix.clone());
+        for i in 0..self.num_children as usize {
+            new_node.keys[i] = self.keys[i];
+            new_node.children[i].clone_from(&self.children[i]);
+        }
+        new_node.inner_twig.clone_from(&self.inner_twig);
+        new_node.num_children = self.num_children;
+        new_node
+    }
+
+    pub(crate) fn get_value_if_single_child(&self) -> (&P, Option<Arc<N>>) {
+        assert_eq!(self.num_children, 1);
+        (&self.prefix, self.children[0].clone())
+    }
+
+    pub(crate) fn grow(&self) -> Node48<P, N> {
+        let mut n48 = Node48::new(self.prefix.clone());
+        for i in 0..self.num_children as usize {
+            if let Some(child) = self.children[i].as_ref() {
+                n48.insert_child(self.keys[i], Arc::clone(child));
+            }
+        }
+        n48.inner_twig.clone_from(&self.inner_twig);
+        n48
+    }
+
+    // Helper function to insert a child node at the specified position
+    #[inline]
+    fn insert_child(&mut self, idx: usize, key: u8, node: Arc<N>) {
+        for i in (idx..self.num_children as usize).rev() {
+            self.keys[i + 1] = self.keys[i];
+            self.children[i + 1] = self.children[i].take();
+        }
+        self.keys[idx] = key;
+        self.children[idx] = Some(node);
+        self.num_children += 1;
+    }
+
+    #[inline]
+    pub(crate) fn children_iter(&self) -> FlatChildren<'_, P, N, WIDTH> {
+        FlatChildren::new(self)
+    }
+
+    pub(crate) fn validate_invariants<F>(&self, mut validate_child: F) -> Result<usize, String>
+    where
+        F: FnMut(&N) -> Result<usize, String>,
+    {
+        let num = self.num_children as usize;
+        if num > WIDTH {
+            return Err(format!("FlatNode has {} children (> {})", num, WIDTH));
+        }
+        for i in 0..num {
+            if self.children[i].is_none() {
+                return Err(format!(
+                    "FlatNode child slot {} is None while num_children is {}",
+                    i, num
+                ));
+            }
+        }
+        for i in num..WIDTH {
+            if self.children[i].is_some() {
+                return Err(format!(
+                    "FlatNode child slot {} is Some while beyond num_children {}",
+                    i, num
+                ));
+            }
+        }
+        for i in 1..num {
+            if self.keys[i - 1] >= self.keys[i] {
+                return Err(format!(
+                    "FlatNode keys not strictly sorted: {} >= {}",
+                    self.keys[i - 1],
+                    self.keys[i]
+                ));
+            }
+        }
+        let mut total = 0;
+        if let Some(inner) = &self.inner_twig {
+            total += validate_child(inner)?;
+        }
+        for i in 0..num {
+            let child = self.children[i].as_ref().unwrap();
+            total += validate_child(child)?;
+        }
+        Ok(total)
+    }
+}
+
+impl<P: KeyTrait, N: Clone, const WIDTH: usize> NodeTrait<N> for FlatNode<P, N, WIDTH> {
+    fn clone(&self) -> Self {
+        let mut new_node = Self::new(self.prefix.clone());
+        for i in 0..self.num_children as usize {
+            new_node.keys[i] = self.keys[i];
+            new_node.children[i].clone_from(&self.children[i])
+        }
+        new_node.inner_twig.clone_from(&self.inner_twig);
+        new_node.num_children = self.num_children;
+        new_node
+    }
+
+    fn replace_child(&self, key: u8, node: Arc<N>) -> Self {
+        let mut new_node = self.clone();
+        let idx = new_node.index(key).unwrap();
+        new_node.keys[idx] = key;
+        new_node.children[idx] = Some(node);
+        new_node
+    }
+
+    fn add_child(&mut self, key: u8, node: N) {
+        let idx = self.find_pos(key).expect("node is full");
+        self.insert_child(idx, key, Arc::new(node));
+    }
+
+    fn find_child(&self, key: u8) -> Option<&Arc<N>> {
+        let idx = self.index(key)?;
+        let child = self.children[idx].as_ref();
+        child
+    }
+
+    fn find_child_mut(&mut self, key: u8) -> Option<&mut N> {
+        let idx = self.index(key)?;
+        let child = self.children[idx].as_mut()?;
+        Some(Arc::make_mut(child))
+    }
+
+    fn delete_child(&self, key: u8) -> Self {
+        let mut new_node = self.clone();
+        let idx = self
+            .keys
+            .iter()
+            .take(self.num_children as usize)
+            .position(|&k| k == key)
+            .unwrap();
+        new_node.children[idx] = None;
+        for i in idx..(WIDTH - 1) {
+            new_node.keys[i] = self.keys[i + 1];
+            new_node.children[i].clone_from(&self.children[i + 1])
+        }
+
+        new_node.keys[WIDTH - 1] = 0;
+        new_node.children[WIDTH - 1] = None;
+        new_node.num_children -= 1;
+
+        new_node
+    }
+
+    #[inline(always)]
+    fn num_children(&self) -> usize {
+        self.num_children as usize
+    }
+
+    #[inline(always)]
+    fn size(&self) -> usize {
+        WIDTH
+    }
+}
+
+/// Inner node holding up to 48 child pointers indexed through a 256-byte key table.
+
+#[derive(Clone)]
+struct Node48Storage<N> {
+    keys: [u8; 256],
+    children: [Option<Arc<N>>; 48],
+}
+
+pub(crate) struct Node48<P: KeyTrait, N> {
+    pub(crate) prefix: P,
+    storage: Box<Node48Storage<N>>,
+    pub(crate) inner_twig: Option<Arc<N>>,
+    child_bitmap: u64,
+}
+
+impl<P: KeyTrait, N: Clone> Node48<P, N> {
+    pub(crate) fn new(prefix: P) -> Self {
+        Self {
+            prefix,
+            storage: Box::new(Node48Storage {
+                keys: [u8::MAX; 256],
+                children: [const { None }; 48],
+            }),
+            inner_twig: None,
+            child_bitmap: 0,
+        }
+    }
+
+    pub(crate) fn insert_child(&mut self, key: u8, node: Arc<N>) {
+        let pos = self.child_bitmap.trailing_ones();
+        assert!(pos < 48);
+
+        self.storage.keys[key as usize] = pos as u8;
+        self.storage.children[pos as usize] = Some(node);
+        self.child_bitmap |= 1 << pos;
+    }
+
+    pub(crate) fn shrink<const NEW_WIDTH: usize>(&self) -> FlatNode<P, N, NEW_WIDTH> {
+        let mut fnode = FlatNode::new(self.prefix.clone());
+        for (key, pos) in self
+            .storage
+            .keys
+            .iter()
+            .enumerate()
+            .filter(|(_, idx)| **idx != u8::MAX)
+        {
+            let child = Arc::clone(self.storage.children[*pos as usize].as_ref().unwrap());
+            let idx = fnode.find_pos(key as u8).expect("node is full");
+            fnode.insert_child(idx, key as u8, child);
+        }
+        fnode.inner_twig.clone_from(&self.inner_twig);
+        fnode
+    }
+
+    pub(crate) fn grow(&self) -> Node256<P, N> {
+        let mut n256 = Node256::new(self.prefix.clone());
+        for (key, pos) in self
+            .storage
+            .keys
+            .iter()
+            .enumerate()
+            .filter(|(_, idx)| **idx != u8::MAX)
+        {
+            let child = Arc::clone(self.storage.children[*pos as usize].as_ref().unwrap());
+            n256.insert_child(key as u8, child);
+        }
+        n256.inner_twig.clone_from(&self.inner_twig);
+        n256
+    }
+
+    #[inline]
+    pub(crate) fn children_iter(&self) -> Node48Children<'_, P, N> {
+        Node48Children::new(self)
+    }
+
+    pub(crate) fn validate_invariants<F>(&self, mut validate_child: F) -> Result<usize, String>
+    where
+        F: FnMut(&N) -> Result<usize, String>,
+    {
+        let num = self.num_children();
+        if num > 48 {
+            return Err(format!("Node48 has {} children (> 48)", num));
+        }
+        let bitmap_count = self.child_bitmap.count_ones() as usize;
+        if bitmap_count != num {
+            return Err(format!(
+                "Node48 bitmap count {} != num_children {}",
+                bitmap_count, num
+            ));
+        }
+        let mut keys_count = 0;
+        for &slot in self.storage.keys.iter() {
+            if slot != u8::MAX {
+                keys_count += 1;
+                if slot >= 48 {
+                    return Err(format!("Node48 slot {} >= 48", slot));
+                }
+                if self.storage.children[slot as usize].is_none() {
+                    return Err(format!("Node48 slot {} is None in children", slot));
+                }
+                if (self.child_bitmap & (1u64 << slot)) == 0 {
+                    return Err(format!("Node48 slot {} not set in child_bitmap", slot));
+                }
+            }
+        }
+        if keys_count != num {
+            return Err(format!(
+                "Node48 keys count {} != num_children {}",
+                keys_count, num
+            ));
+        }
+        let mut total = 0;
+        if let Some(inner) = &self.inner_twig {
+            total += validate_child(inner)?;
+        }
+        for &slot in self.storage.keys.iter() {
+            if slot != u8::MAX {
+                let child = self.storage.children[slot as usize].as_ref().unwrap();
+                total += validate_child(child)?;
+            }
+        }
+        Ok(total)
+    }
+}
+
+impl<P: KeyTrait, N: Clone> NodeTrait<N> for Node48<P, N> {
+    fn clone(&self) -> Self {
+        Node48 {
+            prefix: self.prefix.clone(),
+            storage: self.storage.clone(),
+            inner_twig: self.inner_twig.clone(),
+            child_bitmap: self.child_bitmap,
+        }
+    }
+
+    fn replace_child(&self, key: u8, node: Arc<N>) -> Self {
+        let mut new_node = self.clone();
+        let idx = new_node.storage.keys[key as usize];
+        assert!(idx != u8::MAX);
+        new_node.storage.children[idx as usize] = Some(node);
+
+        new_node
+    }
+
+    fn add_child(&mut self, key: u8, node: N) {
+        self.insert_child(key, Arc::new(node));
+    }
+
+    fn delete_child(&self, key: u8) -> Self {
+        let pos = self.storage.keys[key as usize];
+        assert!(pos != u8::MAX);
+        let mut new_node = self.clone();
+        new_node.storage.keys[key as usize] = u8::MAX;
+        new_node.storage.children[pos as usize] = None;
+        new_node.child_bitmap &= !(1 << pos);
+
+        new_node
+    }
+
+    fn find_child(&self, key: u8) -> Option<&Arc<N>> {
+        let idx = self.storage.keys[key as usize];
+        if idx == u8::MAX {
+            return None;
+        }
+        Some(self.storage.children[idx as usize].as_ref().unwrap())
+    }
+
+    fn find_child_mut(&mut self, key: u8) -> Option<&mut N> {
+        let idx = self.storage.keys[key as usize];
+        if idx == u8::MAX {
+            return None;
+        }
+        let child_arc = self.storage.children[idx as usize].as_mut()?;
+        Some(Arc::make_mut(child_arc))
+    }
+
+    fn num_children(&self) -> usize {
+        self.child_bitmap.count_ones() as usize
+    }
+
+    #[inline(always)]
+    fn size(&self) -> usize {
+        48
+    }
+}
+
+/// Inner node holding up to 256 child pointers indexed directly by byte value.
+pub(crate) struct Node256<P: KeyTrait, N> {
+    pub(crate) prefix: P, // Prefix associated with the node
+    children: Box<[Option<Arc<N>>; 256]>,
+    pub(crate) inner_twig: Option<Arc<N>>,
+    num_children: usize,
+}
+
+impl<P: KeyTrait, N: Clone> Node256<P, N> {
+    pub(crate) fn new(prefix: P) -> Self {
+        Self {
+            prefix,
+            children: Box::new([const { None }; 256]),
+            inner_twig: None,
+            num_children: 0,
+        }
+    }
+
+    pub(crate) fn shrink(&self) -> Node48<P, N> {
+        debug_assert!(self.num_children < 49);
+        let mut indexed = Node48::new(self.prefix.clone());
+        for (key, v) in self
+            .children
+            .iter()
+            .enumerate()
+            .filter_map(|m| m.1.clone().map(|x| (m.0, x)))
+        {
+            indexed.insert_child(key as u8, v);
+        }
+        indexed.inner_twig.clone_from(&self.inner_twig);
+        indexed
+    }
+
+    #[inline]
+    fn insert_child(&mut self, key: u8, node: Arc<N>) {
+        let new_insert = self.children[key as usize].is_none();
+        self.children[key as usize] = Some(node);
+        self.num_children += new_insert as usize;
+    }
+
+    #[inline]
+    pub(crate) fn children_iter(&self) -> Node256Children<'_, P, N> {
+        Node256Children::new(self)
+    }
+
+    pub(crate) fn validate_invariants<F>(&self, mut validate_child: F) -> Result<usize, String>
+    where
+        F: FnMut(&N) -> Result<usize, String>,
+    {
+        let mut child_count = 0;
+        for child_opt in self.children.iter() {
+            if child_opt.is_some() {
+                child_count += 1;
+            }
+        }
+        if child_count != self.num_children {
+            return Err(format!(
+                "Node256 actual children {} != num_children {}",
+                child_count, self.num_children
+            ));
+        }
+        let mut total = 0;
+        if let Some(inner) = &self.inner_twig {
+            total += validate_child(inner)?;
+        }
+        for child in self.children.iter().flatten() {
+            total += validate_child(child)?;
+        }
+        Ok(total)
+    }
+}
+
+impl<P: KeyTrait, N: Clone> NodeTrait<N> for Node256<P, N> {
+    fn clone(&self) -> Self {
+        Self {
+            prefix: self.prefix.clone(),
+            children: self.children.clone(),
+            inner_twig: self.inner_twig.clone(),
+            num_children: self.num_children,
+        }
+    }
+
+    fn replace_child(&self, key: u8, node: Arc<N>) -> Self {
+        debug_assert!(self.children[key as usize].is_some());
+        let mut new_node = self.clone();
+
+        new_node.children[key as usize] = Some(node);
+        new_node
+    }
+
+    #[inline]
+    fn add_child(&mut self, key: u8, node: N) {
+        self.insert_child(key, Arc::new(node));
+    }
+
+    #[inline]
+    fn find_child(&self, key: u8) -> Option<&Arc<N>> {
+        self.children[key as usize].as_ref()
+    }
+
+    fn find_child_mut(&mut self, key: u8) -> Option<&mut N> {
+        let child_arc = self.children[key as usize].as_mut()?;
+        Some(Arc::make_mut(child_arc))
+    }
+
+    #[inline]
+    fn delete_child(&self, key: u8) -> Self {
+        let mut new_node = self.clone();
+        let removed = new_node.children[key as usize].take().is_some();
+        new_node.num_children -= removed as usize;
+        new_node
+    }
+
+    #[inline]
+    fn num_children(&self) -> usize {
+        self.num_children
+    }
+
+    #[inline(always)]
+    fn size(&self) -> usize {
+        256
+    }
+}
+
+pub(crate) struct FlatChildren<'a, P: KeyTrait, N: Clone, const WIDTH: usize> {
+    node: &'a FlatNode<P, N, WIDTH>,
+    inner_yielded: bool,
+    front: usize,
+    back: usize,
+}
+
+impl<'a, P: KeyTrait, N: Clone, const WIDTH: usize> FlatChildren<'a, P, N, WIDTH> {
+    #[inline]
+    pub(crate) fn new(node: &'a FlatNode<P, N, WIDTH>) -> Self {
+        Self {
+            node,
+            inner_yielded: false,
+            front: 0,
+            back: node.num_children as usize,
+        }
+    }
+}
+
+impl<'a, P: KeyTrait, N: Clone, const WIDTH: usize> Iterator for FlatChildren<'a, P, N, WIDTH> {
+    type Item = &'a Arc<N>;
+
+    #[inline]
+    fn next(&mut self) -> Option<Self::Item> {
+        if !self.inner_yielded {
+            self.inner_yielded = true;
+            if let Some(inner) = &self.node.inner_twig {
+                return Some(inner);
+            }
+        }
+        while self.front < self.back {
+            let item = self.node.children[self.front].as_ref();
+            self.front += 1;
+            if item.is_some() {
+                return item;
+            }
+        }
+        None
+    }
+}
+
+impl<'a, P: KeyTrait, N: Clone, const WIDTH: usize> DoubleEndedIterator
+    for FlatChildren<'a, P, N, WIDTH>
+{
+    #[inline]
+    fn next_back(&mut self) -> Option<Self::Item> {
+        while self.back > self.front {
+            self.back -= 1;
+            let item = self.node.children[self.back].as_ref();
+            if item.is_some() {
+                return item;
+            }
+        }
+        if !self.inner_yielded {
+            self.inner_yielded = true;
+            if let Some(inner) = &self.node.inner_twig {
+                return Some(inner);
+            }
+        }
+        None
+    }
+}
+
+pub(crate) struct Node48Children<'a, P: KeyTrait, N: Clone> {
+    node: &'a Node48<P, N>,
+    inner_yielded: bool,
+    front: usize,
+    back: usize,
+}
+
+impl<'a, P: KeyTrait, N: Clone> Node48Children<'a, P, N> {
+    #[inline]
+    pub(crate) fn new(node: &'a Node48<P, N>) -> Self {
+        Self {
+            node,
+            inner_yielded: false,
+            front: 0,
+            back: 256,
+        }
+    }
+}
+
+impl<'a, P: KeyTrait, N: Clone> Iterator for Node48Children<'a, P, N> {
+    type Item = &'a Arc<N>;
+
+    #[inline]
+    fn next(&mut self) -> Option<Self::Item> {
+        if !self.inner_yielded {
+            self.inner_yielded = true;
+            if let Some(inner) = &self.node.inner_twig {
+                return Some(inner);
+            }
+        }
+        while self.front < self.back {
+            let slot = self.node.storage.keys[self.front];
+            self.front += 1;
+            if slot != u8::MAX {
+                return self.node.storage.children[slot as usize].as_ref();
+            }
+        }
+        None
+    }
+}
+
+impl<'a, P: KeyTrait, N: Clone> DoubleEndedIterator for Node48Children<'a, P, N> {
+    #[inline]
+    fn next_back(&mut self) -> Option<Self::Item> {
+        while self.back > self.front {
+            self.back -= 1;
+            let slot = self.node.storage.keys[self.back];
+            if slot != u8::MAX {
+                return self.node.storage.children[slot as usize].as_ref();
+            }
+        }
+        if !self.inner_yielded {
+            self.inner_yielded = true;
+            if let Some(inner) = &self.node.inner_twig {
+                return Some(inner);
+            }
+        }
+        None
+    }
+}
+
+pub(crate) struct Node256Children<'a, P: KeyTrait, N: Clone> {
+    node: &'a Node256<P, N>,
+    inner_yielded: bool,
+    front: usize,
+    back: usize,
+}
+
+impl<'a, P: KeyTrait, N: Clone> Node256Children<'a, P, N> {
+    #[inline]
+    pub(crate) fn new(node: &'a Node256<P, N>) -> Self {
+        Self {
+            node,
+            inner_yielded: false,
+            front: 0,
+            back: 256,
+        }
+    }
+}
+
+impl<'a, P: KeyTrait, N: Clone> Iterator for Node256Children<'a, P, N> {
+    type Item = &'a Arc<N>;
+
+    #[inline]
+    fn next(&mut self) -> Option<Self::Item> {
+        if !self.inner_yielded {
+            self.inner_yielded = true;
+            if let Some(inner) = &self.node.inner_twig {
+                return Some(inner);
+            }
+        }
+        while self.front < self.back {
+            let item = self.node.children[self.front].as_ref();
+            self.front += 1;
+            if item.is_some() {
+                return item;
+            }
+        }
+        None
+    }
+}
+
+impl<'a, P: KeyTrait, N: Clone> DoubleEndedIterator for Node256Children<'a, P, N> {
+    #[inline]
+    fn next_back(&mut self) -> Option<Self::Item> {
+        while self.back > self.front {
+            self.back -= 1;
+            let item = self.node.children[self.back].as_ref();
+            if item.is_some() {
+                return item;
+            }
+        }
+        if !self.inner_yielded {
+            self.inner_yielded = true;
+            if let Some(inner) = &self.node.inner_twig {
+                return Some(inner);
+            }
+        }
+        None
+    }
+}
+
+pub(crate) enum ChildrenIter<'a, P: KeyTrait + 'a, V: Clone + 'a> {
+    Node4(FlatChildren<'a, P, crate::art::Node<P, V>, 4>),
+    Node16(FlatChildren<'a, P, crate::art::Node<P, V>, 16>),
+    Node48(Node48Children<'a, P, crate::art::Node<P, V>>),
+    Node256(Node256Children<'a, P, crate::art::Node<P, V>>),
+    Empty,
+}
+
+impl<'a, P: KeyTrait, V: Clone> Iterator for ChildrenIter<'a, P, V> {
+    type Item = &'a Arc<crate::art::Node<P, V>>;
+
+    #[inline]
+    fn next(&mut self) -> Option<Self::Item> {
+        match self {
+            Self::Node4(i) => i.next(),
+            Self::Node16(i) => i.next(),
+            Self::Node48(i) => i.next(),
+            Self::Node256(i) => i.next(),
+            Self::Empty => None,
+        }
+    }
+}
+
+impl<'a, P: KeyTrait, V: Clone> DoubleEndedIterator for ChildrenIter<'a, P, V> {
+    #[inline]
+    fn next_back(&mut self) -> Option<Self::Item> {
+        match self {
+            Self::Node4(i) => i.next_back(),
+            Self::Node16(i) => i.next_back(),
+            Self::Node48(i) => i.next_back(),
+            Self::Node256(i) => i.next_back(),
+            Self::Empty => None,
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use crate::FixedSizeKey;
+
+    use super::{FlatNode, Node256, Node48, NodeTrait, TwigNode};
+    use rand::prelude::SliceRandom;
+    use std::sync::Arc;
+
+    fn node_test<N: NodeTrait<usize>>(mut node: N, size: usize) {
+        for i in 0..size {
+            node.add_child(i as u8, i);
+        }
+
+        for i in 0..size {
+            assert!(matches!(node.find_child(i as u8), Some(v) if *v == i.into()));
+        }
+
+        for i in 0..size {
+            node = node.delete_child(i as u8);
+        }
+
+        assert_eq!(node.num_children(), 0);
+    }
+
+    #[test]
+    fn flatnode() {
+        let dummy_prefix: FixedSizeKey<8> = FixedSizeKey::create_key("foo".as_bytes());
+
+        node_test(
+            FlatNode::<FixedSizeKey<8>, usize, 4>::new(dummy_prefix.clone()),
+            4,
+        );
+        node_test(
+            FlatNode::<FixedSizeKey<8>, usize, 16>::new(dummy_prefix.clone()),
+            16,
+        );
+        node_test(
+            FlatNode::<FixedSizeKey<8>, usize, 32>::new(dummy_prefix.clone()),
+            32,
+        );
+        node_test(
+            FlatNode::<FixedSizeKey<8>, usize, 48>::new(dummy_prefix.clone()),
+            48,
+        );
+        node_test(
+            FlatNode::<FixedSizeKey<8>, usize, 64>::new(dummy_prefix.clone()),
+            64,
+        );
+
+        // Resize from 16 to 4
+        let mut node = FlatNode::<FixedSizeKey<8>, usize, 16>::new(dummy_prefix.clone());
+        for i in 0..4 {
+            node.add_child(i as u8, i);
+        }
+
+        let resized: FlatNode<FixedSizeKey<8>, usize, 4> = node.resize();
+        assert_eq!(resized.num_children, 4);
+        for i in 0..4 {
+            assert!(matches!(resized.find_child(i as u8), Some(v) if *v == i.into()));
+        }
+
+        // Resize from 4 to 16
+        let mut node = FlatNode::<FixedSizeKey<8>, usize, 4>::new(dummy_prefix.clone());
+        for i in 0..4 {
+            node.add_child(i as u8, i);
+        }
+        let mut resized: FlatNode<FixedSizeKey<8>, usize, 16> = node.resize();
+        assert_eq!(resized.num_children, 4);
+        for i in 4..16 {
+            resized.add_child(i as u8, i);
+        }
+        assert_eq!(resized.num_children, 16);
+        for i in 0..16 {
+            assert!(matches!(resized.find_child(i as u8), Some(v) if *v == i.into()));
+        }
+
+        // Resize from 16 to 48
+        let mut node = FlatNode::<FixedSizeKey<8>, usize, 16>::new(dummy_prefix.clone());
+        for i in 0..16 {
+            node.add_child(i as u8, i);
+        }
+
+        let resized = node.grow();
+        assert_eq!(resized.num_children(), 16);
+        for i in 0..16 {
+            assert!(matches!(resized.find_child(i as u8), Some(v) if *v == i.into()));
+        }
+
+        // Additional test for adding and deleting children
+        let mut node = FlatNode::<FixedSizeKey<8>, usize, 4>::new(dummy_prefix);
+        node.add_child(1, 1);
+        node.add_child(2, 2);
+        node.add_child(3, 3);
+        node.add_child(4, 4);
+        assert_eq!(node.num_children(), 4);
+        assert_eq!(node.find_child(1), Some(&1.into()));
+        assert_eq!(node.find_child(2), Some(&2.into()));
+        assert_eq!(node.find_child(3), Some(&3.into()));
+        assert_eq!(node.find_child(4), Some(&4.into()));
+        assert_eq!(node.find_child(5), None);
+
+        node = node.delete_child(1);
+        node = node.delete_child(2);
+        node = node.delete_child(3);
+        node = node.delete_child(4);
+        assert_eq!(node.num_children(), 0);
+    }
+
+    #[test]
+    fn node48() {
+        let dummy_prefix: FixedSizeKey<8> = FixedSizeKey::create_key("foo".as_bytes());
+
+        // Create and test Node48
+        let mut n48 = Node48::<FixedSizeKey<8>, u8>::new(dummy_prefix.clone());
+        for i in 0..48 {
+            n48.add_child(i, i);
+        }
+        for i in 0..48 {
+            assert_eq!(n48.find_child(i), Some(&i.into()));
+        }
+        for i in 0..48 {
+            n48 = n48.delete_child(i);
+        }
+        for i in 0..48 {
+            assert!(n48.find_child(i as u8).is_none());
+        }
+
+        // Resize from 48 to 16
+        let mut node = Node48::<FixedSizeKey<8>, u8>::new(dummy_prefix.clone());
+        for i in 0..18 {
+            node.add_child(i, i);
+        }
+        assert_eq!(node.num_children(), 18);
+        node = node.delete_child(0);
+        node = node.delete_child(1);
+        assert_eq!(node.num_children(), 16);
+
+        let resized = node.shrink::<16>();
+        assert_eq!(resized.num_children, 16);
+        for i in 2..18 {
+            assert!(matches!(resized.find_child(i), Some(v) if *v == i.into()));
+        }
+
+        // Resize from 48 to 4
+        let mut node = Node48::<FixedSizeKey<8>, u8>::new(dummy_prefix.clone());
+        for i in 0..4 {
+            node.add_child(i, i);
+        }
+        let resized = node.shrink::<4>();
+        assert_eq!(resized.num_children, 4);
+        for i in 0..4 {
+            assert!(matches!(resized.find_child(i), Some(v) if *v == i.into()));
+        }
+
+        // Resize from 48 to 256
+        let mut node = Node48::<FixedSizeKey<8>, u8>::new(dummy_prefix);
+        for i in 0..48 {
+            node.add_child(i, i);
+        }
+
+        let resized = node.grow();
+        assert_eq!(resized.num_children, 48);
+        for i in 0..48 {
+            assert!(matches!(resized.find_child(i), Some(v) if *v == i.into()));
+        }
+    }
+
+    #[test]
+    fn node256() {
+        let dummy_prefix: FixedSizeKey<8> = FixedSizeKey::create_key("foo".as_bytes());
+
+        node_test(
+            Node256::<FixedSizeKey<8>, usize>::new(dummy_prefix.clone()),
+            255,
+        );
+
+        let mut n256 = Node256::new(dummy_prefix.clone());
+        for i in 0..255 {
+            n256.add_child(i, i);
+            assert_eq!(n256.find_child(i), Some(&i.into()));
+            n256 = n256.delete_child(i);
+            assert_eq!(n256.find_child(i), None);
+        }
+
+        // resize from 256 to 48
+        let mut node = Node256::new(dummy_prefix);
+        for i in 0..48 {
+            node.add_child(i, i);
+        }
+
+        let resized = node.shrink();
+        assert_eq!(resized.num_children(), 48);
+        for i in 0..48 {
+            assert!(matches!(resized.find_child(i), Some(v) if *v == i.into()));
+        }
+    }
+
+    #[test]
+    fn twig_insert() {
+        let dummy_prefix: FixedSizeKey<8> = FixedSizeKey::create_key("foo".as_bytes());
+
+        let node = TwigNode::<FixedSizeKey<8>, usize>::new(dummy_prefix.clone(), dummy_prefix);
+
+        let new_node = node.insert(42, 123, 0);
+        assert_eq!(node.values.len(), 0);
+        assert_eq!(new_node.values.len(), 1);
+        assert_eq!(new_node.values[0].value, 42);
+        assert_eq!(new_node.values[0].version, 123);
+    }
+
+    #[test]
+    fn twig_insert_mut() {
+        let dummy_prefix: FixedSizeKey<8> = FixedSizeKey::create_key("foo".as_bytes());
+
+        let mut node = TwigNode::<FixedSizeKey<8>, usize>::new(dummy_prefix.clone(), dummy_prefix);
+
+        node.insert_mut(42, 123, 0);
+        assert_eq!(node.values.len(), 1);
+        assert_eq!(node.values[0].value, 42);
+        assert_eq!(node.values[0].version, 123);
+    }
+
+    #[test]
+    fn twig_get_latest_leaf() {
+        let dummy_prefix: FixedSizeKey<8> = FixedSizeKey::create_key("foo".as_bytes());
+        let mut node = TwigNode::<FixedSizeKey<8>, usize>::new(dummy_prefix.clone(), dummy_prefix);
+        node.insert_mut(42, 123, 0);
+        node.insert_mut(43, 124, 1);
+        let latest_leaf = node.get_latest_leaf();
+        assert_eq!(latest_leaf.unwrap().value, 43);
+    }
+
+    #[test]
+    fn twig_get_leaf_by_version() {
+        let dummy_prefix: FixedSizeKey<8> = FixedSizeKey::create_key("foo".as_bytes());
+        let mut node = TwigNode::<FixedSizeKey<8>, usize>::new(dummy_prefix.clone(), dummy_prefix);
+        node.insert_mut(42, 123, 0);
+        node.insert_mut(43, 124, 1);
+        let leaf = node.get_leaf_by_version(123);
+        assert_eq!(leaf.unwrap().value, 42);
+        let leaf = node.get_leaf_by_version(124);
+        assert_eq!(leaf.unwrap().value, 43);
+    }
+
+    #[test]
+    fn twig_iter() {
+        let dummy_prefix: FixedSizeKey<8> = FixedSizeKey::create_key("foo".as_bytes());
+        let mut node = TwigNode::<FixedSizeKey<8>, usize>::new(dummy_prefix.clone(), dummy_prefix);
+        node.insert_mut(42, 123, 0);
+        node.insert_mut(43, 124, 1);
+        let mut iter = node.iter();
+        assert_eq!(iter.next().unwrap().value, 42);
+        assert_eq!(iter.next().unwrap().value, 43);
+        assert!(iter.next().is_none());
+    }
+
+    #[test]
+    fn memory_leak() {
+        let dummy_prefix: FixedSizeKey<8> = FixedSizeKey::create_key("foo".as_bytes());
+
+        // Create and test flatnode
+        let mut node = FlatNode::<FixedSizeKey<8>, usize, 4>::new(dummy_prefix.clone());
+        for i in 0..4 {
+            node.add_child(i as u8, i);
+        }
+
+        for child in node.children_iter() {
+            assert_eq!(Arc::strong_count(child), 1);
+        }
+
+        // Create and test Node48
+        let mut n48 = Node48::<FixedSizeKey<8>, u8>::new(dummy_prefix.clone());
+        for i in 0..48 {
+            n48.add_child(i, i);
+        }
+
+        for child in n48.children_iter() {
+            assert_eq!(Arc::strong_count(child), 1);
+        }
+
+        // Create and test Node256
+        let mut n256 = Node256::new(dummy_prefix);
+        for i in 0..255 {
+            n256.add_child(i, i);
+        }
+
+        for child in n256.children_iter() {
+            assert_eq!(Arc::strong_count(child), 1);
+        }
+    }
+
+    #[test]
+    fn cache_line_size() {
+        assert!(std::mem::size_of::<FlatNode::<FixedSizeKey<8>, usize, 4>>() <= 64);
+        assert!(std::mem::size_of::<FlatNode::<FixedSizeKey<8>, usize, 16>>() <= 192);
+    }
+
+    #[test]
+    fn verify_node_insert_order() {
+        let dummy_prefix: FixedSizeKey<8> = FixedSizeKey::create_key("foo".as_bytes());
+
+        let mut node4 = FlatNode::<FixedSizeKey<8>, usize, 4>::new(dummy_prefix.clone());
+        node4.add_child(4, 1);
+        node4.add_child(2, 1);
+        node4.add_child(1, 1);
+        node4.add_child(0, 1);
+
+        // verify the order of keys as [0, 1, 2, 4]
+        assert_eq!(node4.keys, [0, 1, 2, 4]);
+
+        let mut node16 = FlatNode::<FixedSizeKey<8>, usize, 16>::new(dummy_prefix);
+        // Insert children into node16 in random order
+        let mut rng = rand::thread_rng();
+        let mut values: Vec<u8> = (0..16).collect();
+        values.shuffle(&mut rng);
+        for value in values {
+            node16.add_child(value, 1);
+        }
+        // Verify the keys have been inserted in order
+        assert_eq!(node16.keys, *(0..16).collect::<Vec<u8>>());
+    }
+
+    #[test]
+    fn twig_get_leaf_by_ts() {
+        let dummy_prefix: FixedSizeKey<8> = FixedSizeKey::create_key("bar".as_bytes());
+        let mut node = TwigNode::<FixedSizeKey<8>, usize>::new(dummy_prefix.clone(), dummy_prefix);
+        // Inserting leaves with different timestamps
+        node.insert_mut(50, 200, 10); // value: 50, version: 200, timestamp: 10
+        node.insert_mut(51, 201, 20); // value: 51, version: 201, timestamp: 20
+
+        // Test case 1: Retrieve leaf by exact timestamp
+        let leaf_by_ts = node.get_leaf_by_ts(10);
+        assert_eq!(leaf_by_ts.unwrap().value, 50);
+
+        // Test case 2: Retrieve leaf by another exact timestamp
+        let leaf_by_ts = node.get_leaf_by_ts(20);
+        assert_eq!(leaf_by_ts.unwrap().value, 51);
+
+        // Test case 3: Attempt to retrieve leaf by a non-existent timestamp
+        let leaf_by_ts = node.get_leaf_by_ts(30);
+        assert_eq!(leaf_by_ts.unwrap().value, 51);
+    }
+
+    #[test]
+    fn test_get_leaf_by_version() {
+        let dummy_prefix: FixedSizeKey<8> = FixedSizeKey::create_key("bar".as_bytes());
+        let mut node = TwigNode::<FixedSizeKey<8>, usize>::new(dummy_prefix.clone(), dummy_prefix);
+        node.insert_mut(50, 200, 10); // value: 50, version: 200, timestamp: 10
+        node.insert_mut(51, 201, 20); // value: 51, version: 201, timestamp: 20
+
+        // Exact version match
+        let leaf = node.get_leaf_by_version(200);
+        assert_eq!(leaf.unwrap().value, 50);
+
+        // Version not present, should get closest lower version
+        let leaf = node.get_leaf_by_version(199);
+        assert!(leaf.is_none());
+
+        // Higher version, should get the highest available version
+        let leaf = node.get_leaf_by_version(202);
+        assert_eq!(leaf.unwrap().value, 51);
+    }
+
+    #[test]
+    fn test_get_leaf_by_ts() {
+        let dummy_prefix: FixedSizeKey<8> = FixedSizeKey::create_key("bar".as_bytes());
+        let mut node = TwigNode::<FixedSizeKey<8>, usize>::new(dummy_prefix.clone(), dummy_prefix);
+        node.insert_mut(50, 200, 10); // value: 50, version: 200, timestamp: 10
+        node.insert_mut(51, 201, 20); // value: 51, version: 201, timestamp: 20
+
+        // Exact timestamp match
+        let leaf = node.get_leaf_by_ts(10);
+        assert_eq!(leaf.unwrap().value, 50);
+
+        // Timestamp not present, should get closest lower timestamp
+        let leaf = node.get_leaf_by_ts(15);
+        assert_eq!(leaf.unwrap().value, 50);
+
+        // Higher timestamp, should get the highest available timestamp
+        let leaf = node.get_leaf_by_ts(25);
+        assert_eq!(leaf.unwrap().value, 51);
+    }
+
+    #[test]
+    fn test_get_all_versions() {
+        let dummy_prefix: FixedSizeKey<8> = FixedSizeKey::create_key("bar".as_bytes());
+        let mut node = TwigNode::<FixedSizeKey<8>, usize>::new(dummy_prefix.clone(), dummy_prefix);
+        node.insert_mut(50, 200, 10); // value: 50, version: 200, timestamp: 10
+        node.insert_mut(51, 201, 20); // value: 51, version: 201, timestamp: 20
+
+        let versions = node.get_all_versions();
+        assert_eq!(versions.len(), 2);
+        assert_eq!(versions[0], (50, 200, 10));
+        assert_eq!(versions[1], (51, 201, 20));
+    }
+
+    #[test]
+    fn test_last_less_than_ts() {
+        let dummy_prefix: FixedSizeKey<8> = FixedSizeKey::create_key("bar".as_bytes());
+        let mut node = TwigNode::<FixedSizeKey<8>, usize>::new(dummy_prefix.clone(), dummy_prefix);
+        node.insert_mut(50, 200, 10); // value: 50, version: 200, timestamp: 10
+        node.insert_mut(51, 201, 20); // value: 51, version: 201, timestamp: 20
+
+        // Timestamp just below an existing timestamp
+        let leaf = node.last_less_than_ts(20);
+        assert_eq!(leaf.unwrap().value, 50);
+
+        // Timestamp well below any existing timestamp
+        let leaf = node.last_less_than_ts(5);
+        assert!(leaf.is_none());
+
+        // Timestamp above all existing timestamps
+        let leaf = node.last_less_than_ts(25);
+        assert_eq!(leaf.unwrap().value, 51);
+    }
+
+    #[test]
+    fn test_last_less_or_equal_ts() {
+        let dummy_prefix: FixedSizeKey<8> = FixedSizeKey::create_key("bar".as_bytes());
+        let mut node = TwigNode::<FixedSizeKey<8>, usize>::new(dummy_prefix.clone(), dummy_prefix);
+        node.insert_mut(50, 200, 10); // value: 50, version: 200, timestamp: 10
+        node.insert_mut(51, 201, 20); // value: 51, version: 201, timestamp: 20
+
+        // Exact timestamp
+        let leaf = node.last_less_or_equal_ts(10);
+        assert_eq!(leaf.unwrap().value, 50);
+
+        // Timestamp not present, should get closest lower timestamp
+        let leaf = node.last_less_or_equal_ts(15);
+        assert_eq!(leaf.unwrap().value, 50);
+
+        // Higher timestamp, should get the highest available timestamp
+        let leaf = node.last_less_or_equal_ts(25);
+        assert_eq!(leaf.unwrap().value, 51);
+    }
+
+    #[test]
+    fn test_first_greater_than_ts() {
+        let dummy_prefix: FixedSizeKey<8> = FixedSizeKey::create_key("bar".as_bytes());
+        let mut node = TwigNode::<FixedSizeKey<8>, usize>::new(dummy_prefix.clone(), dummy_prefix);
+        node.insert_mut(50, 200, 10); // value: 50, version: 200, timestamp: 10
+        node.insert_mut(51, 201, 20); // value: 51, version: 201, timestamp: 20
+
+        // Timestamp just above an existing timestamp
+        let leaf = node.first_greater_than_ts(10);
+        assert_eq!(leaf.unwrap().value, 51);
+
+        // Timestamp well above any existing timestamp
+        let leaf = node.first_greater_than_ts(25);
+        assert!(leaf.is_none());
+
+        // Timestamp below all existing timestamps
+        let leaf = node.first_greater_than_ts(5);
+        assert_eq!(leaf.unwrap().value, 50);
+    }
+
+    #[test]
+    fn test_first_greater_or_equal_ts() {
+        let dummy_prefix: FixedSizeKey<8> = FixedSizeKey::create_key("bar".as_bytes());
+        let mut node = TwigNode::<FixedSizeKey<8>, usize>::new(dummy_prefix.clone(), dummy_prefix);
+        node.insert_mut(50, 200, 10); // value: 50, version: 200, timestamp: 10
+        node.insert_mut(51, 201, 20); // value: 51, version: 201, timestamp: 20
+
+        // Exact timestamp
+        let leaf = node.first_greater_or_equal_ts(10);
+        assert_eq!(leaf.unwrap().value, 50);
+
+        // Timestamp not present, should get closest higher timestamp
+        let leaf = node.first_greater_or_equal_ts(15);
+        assert_eq!(leaf.unwrap().value, 51);
+
+        // Lower timestamp, should get the lowest available timestamp
+        let leaf = node.first_greater_or_equal_ts(5);
+        assert_eq!(leaf.unwrap().value, 50);
+    }
+
+    #[test]
+    fn test_twig_insert_same_version_different_timestamps() {
+        let dummy_prefix: FixedSizeKey<8> = FixedSizeKey::create_key(b"test");
+        let mut twig = TwigNode::<FixedSizeKey<8>, usize>::new(dummy_prefix.clone(), dummy_prefix);
+
+        twig.insert_mut(1, 10, 100);
+        twig.insert_mut(2, 10, 200);
+        twig.insert_mut(3, 10, 50);
+
+        // Values should be sorted by (version, ts) -> (10, 50), (10, 100), (10, 200)
+        let entries: Vec<_> = twig.iter().map(|l| (l.value, l.version, l.ts)).collect();
+        assert_eq!(entries, vec![(3, 10, 50), (1, 10, 100), (2, 10, 200)]);
+
+        // Replacing existing (10, 100)
+        twig.insert_mut(99, 10, 100);
+        let entries: Vec<_> = twig.iter().map(|l| (l.value, l.version, l.ts)).collect();
+        assert_eq!(entries, vec![(3, 10, 50), (99, 10, 100), (2, 10, 200)]);
+    }
+}
