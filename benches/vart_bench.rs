@@ -1,7 +1,8 @@
 use std::collections::BTreeMap;
+use std::hint::black_box;
 use std::time::Instant;
 
-use criterion::{black_box, criterion_group, criterion_main, BenchmarkId, Criterion, Throughput};
+use criterion::{criterion_group, criterion_main, BenchmarkId, Criterion, Throughput};
 use rand::prelude::SliceRandom;
 use rand::SeedableRng;
 use rand::{rngs::StdRng, Rng};
@@ -132,7 +133,7 @@ pub fn rand_delete(c: &mut Criterion) {
         }
         b.iter(|| {
             let key = &keys[rng.gen_range(0..keys.len())];
-            let _ = criterion::black_box(tree.remove(&key.into()));
+            let _ = black_box(tree.remove(&key.into()));
         })
     });
 
@@ -153,7 +154,7 @@ pub fn rand_get(c: &mut Criterion) {
             let mut rng = seeded_rng(0xE080D1A42C207DAF);
             b.iter(|| {
                 let key: u64 = rng.gen_range(0..*size);
-                let _ = criterion::black_box(tree.get(&key.into(), 0));
+                let _ = black_box(tree.get(&key.into(), 0));
             })
         });
     }
@@ -175,7 +176,7 @@ pub fn rand_get_str(c: &mut Criterion) {
             let mut rng = seeded_rng(0xE080D1A42C207DAF);
             b.iter(|| {
                 let key = &keys[rng.gen_range(0..keys.len())];
-                let _ = criterion::black_box(tree.get(&key.into(), 0));
+                let _ = black_box(tree.get(&key.into(), 0));
             })
         });
     }
@@ -196,7 +197,7 @@ pub fn seq_get(c: &mut Criterion) {
         group.bench_with_input(BenchmarkId::new("vart", size), &size, |b, _size| {
             let mut key = 0u64;
             b.iter(|| {
-                let _ = criterion::black_box(tree.get(&key.into(), 0));
+                let _ = black_box(tree.get(&key.into(), 0));
                 key += 1;
             })
         });
@@ -217,7 +218,7 @@ pub fn iter_benchmark(c: &mut Criterion) {
         }
         group.bench_with_input(BenchmarkId::new("vart", size), &size, |b, _size| {
             b.iter(|| {
-                let count = criterion::black_box(tree.iter()).count();
+                let count = black_box(tree.iter()).count();
                 assert_eq!(
                     count, size as usize,
                     "Not all items are present in the tree"
@@ -243,7 +244,7 @@ pub fn range_benchmark(c: &mut Criterion) {
             let start_key: FixedSizeKey<16> = 0u16.into();
             let end_key: FixedSizeKey<16> = ((size - 1) as u16).into();
             b.iter(|| {
-                let count = criterion::black_box(tree.range(&start_key..=&end_key)).count();
+                let count = black_box(tree.range(&start_key..=&end_key)).count();
                 assert_eq!(
                     count, size as usize,
                     "Not all items are present in the tree"
